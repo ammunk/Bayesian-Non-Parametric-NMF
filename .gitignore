@@ -1,2 +1,5 @@
-data/EEG
+data/
 main.py
+__pycache__
+results
+bnsNMF/__pycache__
