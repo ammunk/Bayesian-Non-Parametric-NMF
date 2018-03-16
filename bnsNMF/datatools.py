@@ -1,12 +1,27 @@
 import numpy as np
-from scipy.special import digamma, gamma
+from scipy.special import digamma, gamma, gammaln
+from scipy.stats import expon, gamma as gamma_dist
+from bnsNMF.truncnorm_moments import moments
 
-def trunc_moments(truncnorm, sigma_sq, mu):
+vmoments = np.vectorize(moments)
+def trunc_moments(lower_bound, upper_bound, mu, sigma_sq):
 
-    mean, var = truncnorm.stats(loc=mu, scale=sigma_sq, moments='mv')
-    entropy = truncnorm.entropy(loc=mu, scale=sigma_sq)
-
+    # vectorize moments(), such that moments() works elementwise when applied
+    # to numpy arrays. If dimensions of the inputs does not match - numpy 
+    # broadcasting is applied.
+    _, _, mean, var, entropy = vmoments(lower_bound, upper_bound, mu, sigma_sq)
     return mean, var, entropy
+
+def mean_X_WH_error(X, W_mean, W_mean_sq,
+                    H_mean, H_mean_sq):
+
+    XWH = -2*np.sum(X * (W_mean @ H_mean)) # equals -2trace(X.T @ <W> @ <H>)
+    sum_var_WH= np.sum(
+                        W_mean_sq @ H_mean_sq
+                        - (W_mean**2 @ H_mean**2)
+                        )
+    return np.sum(X**2) + XWH + sum_var_WH + np.sum((W_mean @ H_mean)**2)
+
 
 def means_factor_prod(sum_sq_factor, mean_factor):
     """
@@ -15,65 +30,73 @@ def means_factor_prod(sum_sq_factor, mean_factor):
 
     """
 
-    mean_prod = np.dot(mean_factor.transpose(), mean_factor)
-    n = mean_prod.shape()[0]
+    mean_prod = mean_factor.transpose() @ mean_factor
+    n = mean_prod.shape[0]
     mean_prod.flat[::n + 1] = sum_sq_factor # .flat[] allows for inplace assignment
 
     return mean_prod
 
-def prod_sum_W(X, mean_W, mean_H):
-    """
-    Calculates W_MU = H*X^T - W_old*HH_zero_diag
-
-    """
-
-    HH_zero_diag = np.dot(mean_H, mean_H.transpose())
-    np.fill_diagonal(HH_zero_diag, 0)
-
-    HX = np.dot(mean_H, X.transpose())
-    WHH = np.dot(mean_W, HH_zero_diag)
-
-    return HX - WHH
-
-def prod_sum_H(X, mean_H, mean_W):
-    """
-    Calculates factor_mix = W^T*X - WW_zero_diag*H_old
-
-    """
-
-    WW_zero_diag = np.dot(mean_W, mean_W.transpose())
-    np.fill_diagonal(WW_zero_diag, 0)
-
-    WX = np.dot(mean_W.transpose(), X)
-    HWW = np.dot(WW_zero_diag, mean_H)
-
-    return HX - WHH
-
 def gamma_moments(alpha, beta):
+
+    # all alphas ought to be larger than two, otherwise inv_mean is
+    # ill-defined. However, we do not need it.
+
+    # inv_mean = beta / (alpha - 1)
 
     mean = alpha / beta
     var = mean / beta
-    inv_mean = beta / (alpha - 1 )
     ln_mean = digamma(alpha) - np.log(beta)
 
-    entropy = alpha - np.log(beta) + np.log(gamma(alpha)) \
-              + (1 -alpha)*digamma(alpha)
+    entropy = alpha - np.log(beta) + gammaln(alpha) \
+              + (1 - alpha)*digamma(alpha)
 
-    return mean, var, inv_mean, ln_mean, entropy
-
-def gamma_factor(alpha, beta):
-    return beta**alpha / gamma(alpha)
+    return mean, var, ln_mean, entropy
 
 def gamma_prior_elbo(mean, ln_mean, alpha_tau, beta_tau):
-    return np.log(gamma_factor(alpha_tau, beta_tau)) \
+    return alpha_tau * np.log(beta_tau) \
+           - gammaln(alpha_tau)\
            + (alpha_tau - 1)*ln_mean \
            - beta_tau*mean
 
-def mean_sq_and_sum(mean, var):
+def mean_sq(mean, var):
     """
-    Calculates <XX> of stochastic variable x and sums across columns
+    Calculates <XX> of stochastic variable x
     """
-    return var + mean**2, np.inner(var + mean**2)
+    return var + mean**2
 
 def nan_present(X):
     return np.isnan(np.sum(X)) # fast nan check
+
+def sample_init_factor_element(lambda_alpha, lambda_beta, 
+                               n_samples_lam=50, n_samples_F=50):
+    gam = gamma_dist(a=lambda_alpha, loc=0, scale=1/lambda_beta)
+    lambdas = gam.rvs(size=n_samples_lam)
+
+    elements = []
+    for lam in lambdas:
+        elements = np.append(elements, 
+                             expon.rvs(loc=0, scale=1/lam, size=n_samples_F))
+    mean = elements.mean()
+    # unbiased variance
+    var = elements.var(ddof=1)
+
+    return mean, var
+
+def sample_init_factor_element_ARD(lambda_alpha, lambda_beta, factor_dimension,
+                                   n_samples_lam=50, n_samples_F=50):
+
+    gam = gamma_dist(a=lambda_alpha, loc=0, scale=1/lambda_beta)
+    lambdas = gam.rvs(size=n_samples_lam)
+    samples = n_samples_F*factor_dimension
+
+    elements = []
+    for lam in lambdas:
+        elements = np.append(elements, 
+                         expon.rvs(loc=0, scale=1/lam, size=samples))
+    elements = elements.reshape(factor_dimension, -1)
+    mean = elements.mean(axis=1)
+    # unbiased variance
+    var = elements.var(ddof=1, axis=1)
+
+    return mean, var
+

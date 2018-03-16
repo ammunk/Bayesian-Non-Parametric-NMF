@@ -4,3 +4,6 @@ __pycache__
 results
 bnsNMF/__pycache__
 data_loader.py
+test_truncnorm.py
+bnsNMF/truncnorm_moments.py
+start_mongo_DB

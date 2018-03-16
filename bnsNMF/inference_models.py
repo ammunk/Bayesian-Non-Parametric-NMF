@@ -6,47 +6,65 @@ from bnsNMF.variational_distributions import WFactor, HFactor,\
                                              FactorPriorGammaARD, NoiseGamma
 
 from bnsNMF.loggers import Logger
+from bnsNMF.datatools import sample_init_factor_element, \
+                             sample_init_factor_element_ARD,\
+                             mean_X_WH_error
 
 class VBBase:
 
-    def __init__(self, X, D, noise_alpha, noise_beta, user_params):
+    def __init__(self, X, K, tolerance, max_iter, noise_alpha, noise_beta):
+        self.max_iter = max_iter
+        self.tolerance = tolerance
+        self.tau_alpha = noise_alpha
+        self.tau_beta = noise_beta
         self.X = X
-        self.D = D
-        self.alpha_tau = noise_alpha
-        self.beta_tau = noise_beta
+        self.K = K
         self.I, self.J = self.X.shape
-        self.max_iter = user_params['max_iter']
-        self.tolerance = user_params['tolerance']
+        self.data_size = self.I * self.J
 
-        # build model
-        self.q_W = WFactor(0, np.infty, self.D)
-        self.q_H = HFactor(0, np.infty, self.D)
-        self.q_tau = NoiseGamma(self.I*self.J, self.X)
+        # build basic model components
+        self.q_W = WFactor(0, np.infty, self.K, self.I)
+        self.q_H = HFactor(0, np.infty, self.K, self.J)
+        self.q_tau = NoiseGamma(self.I*self.J, self.X, 
+                                self.tau_alpha, self.tau_beta)
 
-        # calculate various constants
-        self.const_likelihood_elbo = -self.I*0.5*np.log(2*np.pi)
-        self.X_fro_sq = np.sum(X**2)
+    def train(self, run, log):
 
-    def train(self):
+        self.run = run
+        self.log = log
 
         ELBO_diff = np.inf
         ELBO_old = ELBO_diff
         i = 0
-        with Logger(user_params) as logger:
-            while ELBO_diff < self.tolerance and i < self.max_iter:
-                self._update()
+        self._initialize()
+        while abs(ELBO_diff) > self.tolerance and i < self.max_iter:
+            self._update()
 
-                ELBO = self._ELBO()
-                ELBO_diff = ELBO_old - ELBO
-                ELBO_old = ELBO
-                i = i + 1
-                logger.log_update(ELBO, i, self.predict())
+            # calculate ELBO, which we seek to maximize
+            # maximizing the ELBO corresponds to minimizing the 
+            # KL divergence
+            ELBO = self._ELBO()
+            ELBO_diff = ELBO - ELBO_old
+            ELBO_old = ELBO
+            sum_sq_error = np.sum((self.X-self.predict())**2)
+            i = i + 1
+            self.run.log_scalar("training.elbo", ELBO.item(), i)
+            self.run.log_scalar("training.elbo_diff", ELBO_diff.item(), i)
+            self.run.log_scalar("training.sq_error", sum_sq_error.item(), i)
+            msg = (f"\n\tIteration = {i}\n\tELBO = {ELBO}"
+                   f"\n\tELBO diff = {ELBO_diff}\n"
+                   f"\tSq Error = {sum_sq_error}\n============================"
+                   "===================")
+            self.log.info(msg)
+
+    def _initialize(self):
+        pass
 
     def _update(self):
         pass
 
     def predict(self):
-        return np.dot(self.q_W.mean, self.q_H.mean)
+        return self.q_W.mean @ self.q_H.mean
 
     def transform(self, X):
         pass
@@ -55,11 +73,12 @@ class VBBase:
         pass
 
     def _base_ELBO(self):
-        self.inv_tau_mean, self.ln_tau_mean = self.q_tau.mean,\
+        self.tau_mean, self.ln_tau_mean = self.q_tau.mean,\
                                               self.q_tau.ln_mean
 
         lik_elbo = self._ELBO_likelihood()
-        noise_elbo = self.q_tau.elbo_part(self.alpha_tau, self.beta_tau)
+        noise_elbo = self.q_tau.elbo_part()
+        return lik_elbo + noise_elbo
 
     def _ELBO_likelihood(self):
         W_mean = self.q_W.mean
@@ -67,26 +86,24 @@ class VBBase:
         H_mean = self.q_H.mean
         H_mean_sq = self.q_H.mean_sq
 
-        XWH = -2*np.sum(self.X * np.dot(W_mean, H_mean))
-        mWHsq_sum_sqWH_mean = np.sum(
-                            np.dot(W_mean_sq, H_mean_sq)
-                            - np.dot(W_mean**2, H_mean**2)
-                            )
-        ELBO_lik = self.const_likelihood_elbo - self.J*0.5*self.I*ln_tau_mean
-        ELBO_lik = ELBO_lik - 0.5*inv_tau_mean * (
-                                                  self.X_fro_sq + XWH
-                                                  + mWHsq_sum_sqWH_mean
-                                                 )
+        sum_mean_sq_error = mean_X_WH_error(self.X,
+                                            self.q_W.mean, self.q_W.mean_sq,
+                                            self.q_H.mean, self.q_H.mean_sq)
+        ELBO_lik = self.data_size * 0.5 * (self.ln_tau_mean - np.log(2*np.pi)) 
+        ELBO_lik = ELBO_lik - 0.5*self.tau_mean * (sum_mean_sq_error)
         return ELBO_lik
 
 class psNMF(VBBase):
 
-    def __init__(self, X, D, noise_alpha, noise_beta, 
-                 lambda_alpha, lambda_beta, user_params):
-        super().__init__(X, D, noise_alpha, noise_beta, user_params)
+    def __init__(self, X, K, tolerance, max_iter, noise_alpha, noise_beta,
+                 factor_prior_alpha, factor_prior_beta):
+        super().__init__(X, K, tolerance, max_iter, noise_alpha, noise_beta)
 
-        self.q_lambda_W = FactorPriorGamma()
-        self.q_lambda_H = FactorPriorGamma()
+        self.lambda_alpha = factor_prior_alpha
+        self.lambda_beta = factor_prior_beta
+
+        self.q_lambda_W = FactorPriorGamma(self.lambda_alpha, self.lambda_beta)
+        self.q_lambda_H = FactorPriorGamma(self.lambda_alpha, self.lambda_beta)
 
     def _update(self):
 
@@ -104,45 +121,124 @@ class psNMF(VBBase):
 
     def _ELBO(self):
         base_elbo = self._base_ELBO() # noise elbo is included here
-        elbo_W = self.q_W.elbo_part(self.q_lambda_W.inv_mean, 
+        elbo_W = self.q_W.elbo_part(self.q_lambda_W.mean, 
                                     self.q_lambda_W.ln_mean)
-        elbo_H = self.q_H.elbo_part(self.q_lambda_H.inv_mean, 
+        elbo_H = self.q_H.elbo_part(self.q_lambda_H.mean, 
                                     self.q_lambda_H.ln_mean)
-        elbo_lambda_W = self.q_lambda_W.elbo_part(self.lambda_alpha, 
-                                                  self.lambda_beta)
-        elbo_lambda_H = self.q_lambda_H.elbo_part(self.lambda_alpha, 
-                                                  self.lambda_beta)
-
+        elbo_lambda_W = self.q_lambda_W.elbo_part()
+        elbo_lambda_H = self.q_lambda_H.elbo_part()
+        if np.any(np.isnan([base_elbo, elbo_W, elbo_H, elbo_lambda_W, elbo_lambda_H])):
+            print(base_elbo, elbo_W, elbo_H, elbo_lambda_W, elbo_lambda_H)
         return base_elbo + elbo_W + elbo_H + elbo_lambda_W + elbo_lambda_H
+
+    def _initialize(self):
+        mean_W =  np.empty([self.I, self.K])
+        var_W = mean_W.copy()
+
+        mean_H = np.empty([self.K, self.J])
+        var_H = mean_H.copy()
+
+
+        for i in range(self.I):
+            for d in range(self.K):
+                estimates  = sample_init_factor_element(
+                                                       self.lambda_alpha,
+                                                       self.lambda_beta,
+                                                       n_samples_lam=10,
+                                                       n_samples_F=10)
+                mean_W[i,d], var_W[i,d] = estimates
+
+        for d in range(self.K):
+            for j in range(self.J):
+                estimates = sample_init_factor_element(
+                                                       self.lambda_alpha,
+                                                       self.lambda_beta,
+                                                       n_samples_lam=10,
+                                                       n_samples_F=10)
+                mean_H[d,j], var_H[d,j] = estimates
+
+        self.q_W.initialize(mean_W, var_W)
+        self.q_H.initialize(mean_H, var_H)
+
+        # update other factors once!
+
+        # update hyperparameters (under sparse model)
+        self.q_lambda_W.update(self.q_W.mean)
+        self.q_lambda_H.update(self.q_H.mean)
+        # noise update
+        self.q_tau.update(self.q_W.mean, self.q_W.mean_sq_sum, 
+                          self.q_H.mean, self.q_H.mean_sq_sum)
+
 
 class pNMF(VBBase):
 
-    def __init__(self, X, D, noise_alpha, noise_beta, 
-                 lambda_alpha, lambda_beta):
-        super().__init__(X, D, noise_alpha, noise_beta)
+    def __init__(self, X, K, tolerance, max_iter, noise_alpha, noise_beta,
+                 factor_prior_alpha, factor_prior_beta):
+        super().__init__(X, K, tolerance, max_iter, noise_alpha, noise_beta)
 
-        self.q_lambda = FactorPriorGammaARD(self.I + self.J)
+        self.lambda_alpha = factor_prior_alpha
+        self.lambda_beta = factor_prior_beta
+
+        self.q_lambda = FactorPriorGammaARD(self.I + self.J, self.lambda_alpha, 
+                                            self.lambda_beta)
 
     def _update(self):
 
         # update factors (W and H) one after the other
-        self.q_W.update(self.X, self.q_lambda.mean, self.q_tau.mean,
-                        self.q_H.mean, self.q_H.mean_sq_sum)
-        self.q_H.update(self.X, self.q_lambda.mean, self.q_tau.mean,
-                        self.q_W.mean, self.q_W.mean_sq_sum)
+        self.q_W.update(self.X, self.q_lambda.mean.reshape(1,-1), 
+                        self.q_tau.mean,self.q_H.mean, self.q_H.mean_sq_sum)
+        self.q_H.update(self.X, self.q_lambda.mean.reshape(-1,1), 
+                        self.q_tau.mean, self.q_W.mean, self.q_W.mean_sq_sum)
         # update hyperparameters (under ARD prior)
-        self.q_lambda.update(self.q_W.mean_sq, self.q_H.means_sq)
+        self.q_lambda.update(self.q_W.mean, self.q_H.mean)
         # noise update
         self.q_tau.update(self.q_W.mean, self.q_W.mean_sq_sum, 
                           self.q_H.mean, self.q_H.mean_sq_sum)
 
     def _ELBO(self):
         base_elbo = self._base_ELBO() # noise elbo is included here
-        elbo_W = self.q_W.elbo_part(self.q_lambda_W.inv_mean, 
-                                    self.q_lambda_W.ln_mean)
-        elbo_H = self.q_H.elbo_part(self.q_lambda_H.inv_mean, 
-                                    self.q_lambda_H.ln_mean)
-        elbo_lambda = self.q_lambda.elbo_part(self.lambda_alpha, 
-                                              self.lambda_beta)
+        elbo_W = self.q_W.elbo_part(self.q_lambda.mean.reshape(1,-1), 
+                                    self.q_lambda.ln_mean.reshape(1,-1))
+        elbo_H = self.q_H.elbo_part(self.q_lambda.mean.reshape(-1,1), 
+                                    self.q_lambda.ln_mean.reshape(-1,1))
+        elbo_lambda = self.q_lambda.elbo_part()
 
-        return base_elbo + elbo_W + elbo_H + elbo_lambda_W + elbo_lambda_H
+        return base_elbo + elbo_W + elbo_H + elbo_lambda
+
+    def _initialize(self):
+        mean_W =  np.empty([self.I, self.K])
+        var_W = mean_W.copy()
+
+        mean_H = np.empty([self.K, self.J])
+        var_H = mean_H.copy()
+
+
+        for d in range(self.K):
+            estimates  = sample_init_factor_element_ARD(
+                                                    self.lambda_alpha,
+                                                    self.lambda_beta, 
+                                                    self.I,
+                                                    n_samples_lam=10,
+                                                    n_samples_F=10
+                                                    )
+            mean_W[:,d], var_W[:,d] = estimates
+
+            estimates = sample_init_factor_element_ARD(
+                                                    self.lambda_alpha,
+                                                    self.lambda_beta, 
+                                                    self.J,
+                                                    n_samples_lam=10,
+                                                    n_samples_F=10
+                                                    )
+            mean_H[d,:], var_H[d,:] = estimates
+
+        self.q_W.initialize(mean_W, var_W)
+        self.q_H.initialize(mean_H, var_H)
+
+        # update other factors once
+
+        # update hyperparameters (under ARD prior)
+        self.q_lambda.update(self.q_W.mean, self.q_H.mean)
+        # noise update
+        self.q_tau.update(self.q_W.mean, self.q_W.mean_sq_sum, 
+                          self.q_H.mean, self.q_H.mean_sq_sum)

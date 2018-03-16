@@ -1,107 +1,173 @@
 import numpy as np
 from scipy.stats import truncnorm, gamma, expon
 from bnsNMF.datatools import trunc_moments, means_factor_prod,\
-                             gamma_moments, gamma_prior_elbo, mean_sq_and_sum
+                             gamma_moments, gamma_prior_elbo, mean_sq
 
 
 class FactorTruncNormVB:
 
     def __init__(self, lower_bound, upper_bound, D):
-        self.dist = truncnorm(lower_bound, upper_bound)
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
         self.D = D
 
     def sampling(self, n_samples, *args, **kwargs):
         self.dist.rvs(*args, size=n_samples, **kwargs)
 
-    def moments(self):
-        self.mean, self.var, self.etrpy = trunc_moments(
-                                                         self.dist, 
-                                                         self.sigma_sq, 
-                                                         self.mu
-                                                         )
-        self.mean_sq, self.mean_sq_sum = mean_sq_and_sum(self.mean, self.var)
+    def elbo_part(self, mean_lambda, ln_mean_lambda):
+        """ Calculate ELBO contribution from factors
 
-    def elbo_part(self, mean_inv_lambda, ln_mean_lambda):
-        """
             Regardless whether the lambda moments are vectors (ARD)
             or matrices (psNMF), as we rely on broadcasting, when we
             deal vectors
         """
 
-        prior_elbo = -np.sum(self.mean*mean_inv_lambda + ln_mean_lambda)
+        prior_elbo = np.sum(ln_mean_lambda - self.mean*mean_lambda)
         entropy_elbo = np.sum(self.etrpy)
 
-        return prior_elbo + entropy
+        return prior_elbo + entropy_elbo
+
+    def initialize(self, est_mean, est_var):
+        """ Initialize mean and variance
+
+        Takes estimated mean and variance as argument and set these
+        as initial values.
+
+        These values are estimated through sampling using prior
+        hyperparameters
+        """
+        self.mean = est_mean
+        self.var = est_var
+        self.mean_sq = mean_sq(self.mean, self.var)
+        self.cal_mean_sq_sum()
+
+    def cal_mean_sq_sum(self):
+        pass
 
 class WFactor(FactorTruncNormVB):
 
-    def update(X, mean_lambda, mean_tau, mean_H, mean_sq_sum_H):
+    def __init__(self, lower_bound, upper_bound, D, I):
+        super().__init__(lower_bound, upper_bound, D)
+        self.I = I
+        self.mu = np.empty([I, D])
+        self.var = self.mu.copy()
+        self.etrpy = self.var.copy()
 
-        sigma_sq = np.reciprocal(mean_tau*mean_sq_sum_H.transpose())
-        self.sigma_sq = sigma_sq.repeat(self.D, axis=1)
+    def update(self, X, mean_lambda, mean_tau, mean_H, mean_sq_sum_H):
+        self.sigma_sq = np.reciprocal(mean_tau*mean_sq_sum_H)
 
-        factor_mix = prod_sum_W(X, self.mean, mean_H)
-        self.mu = self.sigma_sq * (mean_tau*factor_mix - mean_lambda)
+        HH_zero_diag = mean_H @ mean_H.transpose()
+        np.fill_diagonal(HH_zero_diag, 0)
+        HX = X @ mean_H.transpose() 
 
-        self.moments()
+        for d in np.random.permutation(self.D):
+            prod_mix = HX[:,d] - self.mean @ HH_zero_diag[:,d]
+            self.mu[:,d] =  self.sigma_sq[d] * (mean_tau * prod_mix 
+                                                  - mean_lambda[:,d])
+            self.moments(d)
+
+        self.cal_mean_sq_sum()
+
+    def cal_mean_sq_sum(self):
+        self.mean_sq_sum = np.sum(self.mean_sq, axis=0)
+
+    def moments(self, d):
+        self.mean[:,d], self.var[:,d], self.etrpy[:,d] = trunc_moments(
+                                                         self.lower_bound,
+                                                         self.upper_bound,
+                                                         self.mu[:,d],
+                                                         self.sigma_sq[d]
+                                                                      )
+        self.mean_sq[:,d] = mean_sq(self.mean[:,d], self.var[:,d])
 
 class HFactor(FactorTruncNormVB):
 
-    def update(X, mean_lambda, mean_tau, mean_W, mean_sq_sum_W):
+    def __init__(self, lower_bound, upper_bound, D, J):
+        super().__init__(lower_bound, upper_bound, D)
+        self.J = J
+        self.mu = np.empty([D,J])
+        self.var = self.mu.copy()
+        self.etrpy = self.var.copy()
 
-        sigma_sq = np.reciprocal(mean_tau*mean_sq_sum_W)
-        self.sigma_sq = sigma_sq.repeat(self.D, axis=0)
+    def update(self, X, mean_lambda, mean_tau, mean_W, mean_sq_sum_W):
 
-        factor_mix = prod_sum_H(X, self.mean, mean_W)
-        self.mu = self.sigma_sq * (mean_tau*factor_mix - mean_lambda)
+        self.sigma_sq = np.reciprocal(mean_tau*mean_sq_sum_W)
 
-        self.moments()
+        WW_zero_diag = mean_W.transpose() @ mean_W
+        np.fill_diagonal(WW_zero_diag, 0)
+        WX = mean_W.transpose() @ X
+
+        for d in np.random.permutation(self.D):
+            prod_mix =  WX[d,:] - WW_zero_diag[d,:] @ self.mean
+            self.mu[d,:] =  self.sigma_sq[d] * (mean_tau * prod_mix 
+                                                  - mean_lambda[d,:])
+            self.moments(d)
+
+        self.cal_mean_sq_sum()
+
+    def cal_mean_sq_sum(self):
+        self.mean_sq_sum = np.sum(self.mean_sq, axis=1)
+
+    def moments(self,d):
+        self.mean[d,:], self.var[d,:], self.etrpy[d,:] = trunc_moments(
+                                                         self.lower_bound,
+                                                         self.upper_bound,
+                                                         self.mu[d,:],
+                                                         self.sigma_sq[d]
+                                                        )
+        self.mean_sq[d,:] = mean_sq(self.mean[d,:], self.var[d,:])
 
 class NoiseGamma:
 
-    def __init__(self, data_size, X):
-        self.data_size
-        self.XT = X.transpose()
-        self.tr_XX = np.sum(np.inner(self.XT, X))
+    def __init__(self, data_size, X, tau_alpha, tau_beta):
+        self.tau_alpha = tau_alpha
+        self.tau_beta = tau_beta
+        self.X = X
+        self.trace_XX = X.ravel() @ X.ravel()
 
-    def update(mean_W, mean_sq_sum_W, mean_H,
+        self.alpha = tau_alpha + 0.5 * data_size
+
+    def update(self, mean_W, mean_sq_sum_W, mean_H,
                mean_sq_sum_H):
         mean_W_prod = means_factor_prod(mean_sq_sum_W, mean_W)
         mean_H_prod = means_factor_prod(mean_sq_sum_H,
                                         mean_H.transpose())
 
-        # Use np.inner for fast trace of two matrices
-        trace_XWH = np.sum(np.inner(self.XT, np.dot(mean_W, mean_H)))
-        trace_WWHH = np.sum(np.inner(mean_W_prod, mean_H_prod))
+        trace_XTWH = self.X.ravel() @ (mean_W @ mean_H).ravel()
+        trace_WWHH = mean_W_prod.transpose().ravel() @ mean_H_prod.ravel()
 
-        self.beta = self.beta + 0.5 * (self.trace_XX + trace_WWHH) \
-                    - 2 * trace_XWH
-        self.alpha = self.alpha + 0.5 * self.data_size
+        # update beta (alpha needs only one update - see __init__())
+        self.beta = self.tau_beta + 0.5 * (self.trace_XX + trace_WWHH \
+                    - 2 * trace_XTWH)
 
         self.moments()
 
     def sampling(self, n_samples, *args, **kwargs):
         self.dist = gamma(self.alpha)
 
-    def elbo_part(self, alpha_tau, beta_tau):
-        prior_elbo =  gamma_prior_elbo(self.mean, self.ln_mean, alpha_tau,
-                                       beta_tau)
+    def elbo_part(self):
+        prior_elbo =  gamma_prior_elbo(self.mean, self.ln_mean, self.tau_alpha,
+                                       self.tau_beta)
         entropy_elbo = self.etrpy
 
         return prior_elbo + entropy_elbo
 
     def moments(self):
         moments = gamma_moments(self.alpha, self.beta)
-        self.mean, self.var, selv.inv_mean, self.ln_mean, self.etrpy = moments
-
+        self.mean, self.var, self.ln_mean, self.etrpy = moments
 
 class FactorPriorGamma:
 
-    def __init__(self):
+    def __init__(self, lambda_alpha, lambda_beta):
 
-    def update(mean_sq):
-        self.alpha = self.alpha + 0.5
-        self.beta = self.beta + 0.5 * mean_sq
+        self.lambda_alpha = lambda_alpha
+        self.lambda_beta = lambda_beta
+
+        self.alpha = lambda_alpha + 0.5
+
+    def update(self, mean):
+        # update beta (alpha needs only one update - see __init__())
+        self.beta = self.lambda_beta + mean
 
         self.moments()
 
@@ -109,9 +175,9 @@ class FactorPriorGamma:
         self.dist = gamma(self.alpha)
         self.dist.rvs(*args, size=n_samples, **kwargs)
 
-    def elbo_part(self, alpha_tau, beta_tau):
+    def elbo_part(self):
         prior_elbo =  np.sum(gamma_prior_elbo(self.mean, self.ln_mean, 
-                             alpha_tau, beta_tau))
+                             self.lambda_alpha, self.lambda_beta))
 
         entropy_elbo = np.sum(self.etrpy)
 
@@ -119,18 +185,21 @@ class FactorPriorGamma:
 
     def moments(self):
         moments = gamma_moments(self.alpha, self.beta)
-        self.mean, self.var, selv.inv_mean, self.ln_mean, self.etrpy = moments
+        self.mean, self.var, self.ln_mean, self.etrpy = moments
 
 
 class FactorPriorGammaARD:
 
-    def __init__(self, data_circum):
-        self.data_circum = data_circum
+    def __init__(self, data_circum, lambda_alpha, lambda_beta):
+        self.lambda_alpha = lambda_alpha
+        self.lambda_beta = lambda_beta
 
-    def update(mean_sq_W, mean_sq_H):
-        self.alpha = self.alpha + self.data_circum
-        self.beta = self.beta + (np.sum(mean_sq_W, axis=1) 
-                                       + np.sum(mean_sq_H, axis=0))
+        self.alpha = lambda_alpha + data_circum
+
+    def update(self, mean_W, mean_H):
+        # update beta (alpha needs only one update - see __init__())
+        self.beta = self.lambda_beta + (np.sum(mean_W, axis=0) 
+                                       + np.sum(mean_H, axis=1))
 
         self.moments()
 
@@ -138,10 +207,10 @@ class FactorPriorGammaARD:
         self.dist = gamma(self.alpha)
         self.dist.rvs(*args, size=n_samples, **kwargs)
 
-    def elbo_part(self, alpha_tau, beta_tau):
+    def elbo_part(self):
 
         prior_elbo =  np.sum(gamma_prior_elbo(self.mean, self.ln_mean, 
-                             alpha_tau, beta_tau))
+                             self.lambda_alpha, self.lambda_beta))
 
         entropy_elbo = np.sum(self.etrpy)
 
@@ -149,4 +218,4 @@ class FactorPriorGammaARD:
 
     def moments(self):
         moments = gamma_moments(self.alpha, self.beta)
-        self.mean, self.var, selv.inv_mean, self.ln_mean, self.etrpy = moments
+        self.mean, self.var, self.ln_mean, self.etrpy = moments
