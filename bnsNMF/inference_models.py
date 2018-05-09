@@ -5,18 +5,20 @@ from bnsNMF.variational_distributions import LFactor, RFactor,\
                                              FactorPriorGamma,\
                                              FactorPriorGammaARD, NoiseGamma,\
                                              BNPWFactor, BetaPrior,\
-                                             FactorBernoulli
+                                             FactorBernoulli,\
+                                             FactorPriorBNP
 
 from bnsNMF.loggers import Logger
 from bnsNMF.datatools import sample_init_factor_element, \
                              sample_init_factor_element_ARD, \
+                             sample_init_Z_element, \
                              mean_sq, mean_X_LR_error_fast
 
 
 class FactorStats:
 
     def __init__(self, Factor, factor_type):
-        self.factor = Factor # pass by reference (when Factor changes 
+        self.factor = Factor # pass by reference (when Factor changes
                              # in main program, it does here too)
         self.add_factor = False
         if factor_type == "L":
@@ -37,7 +39,7 @@ class FactorStats:
             self.mean = mean*added_mean
             self.mean_sq_sum = np.sum(tmp*added_tmp, axis=self.sum_axis)
 
-    def add_factor(self, Add_Factor):
+    def new_factor(self, Add_Factor):
 
         self.add_factor = True
         self.added_factor = Add_Factor
@@ -60,7 +62,7 @@ class VBBase:
         self.q_H = RFactor(0, np.infty, self.K, self.J)
         self.stats_L = FactorStats(self.q_W, 'L')
         self.stats_R = FactorStats(self.q_H, 'R')
-        self.q_tau = NoiseGamma(self.I*self.J, self.X, 
+        self.q_tau = NoiseGamma(self.I*self.J, self.X,
                                 self.tau_alpha, self.tau_beta)
 
     def train(self, run, log):
@@ -77,7 +79,7 @@ class VBBase:
             self._update()
 
             # calculate ELBO, which we seek to maximize
-            # maximizing the ELBO corresponds to minimizing the 
+            # maximizing the ELBO corresponds to minimizing the
             # KL divergence
             ELBO = self._ELBO()
             ELBO_diff = ELBO - ELBO_old
@@ -123,7 +125,7 @@ class VBBase:
     def _ELBO_likelihood(self):
 
         sum_mean_sq_error = self.q_tau.sum_mean_sq_error
-        ELBO_lik = self.data_size * 0.5 * (self.ln_tau_mean - np.log(2*np.pi)) 
+        ELBO_lik = self.data_size * 0.5 * (self.ln_tau_mean - np.log(2*np.pi))
         ELBO_lik = ELBO_lik - 0.5*self.tau_mean * (sum_mean_sq_error)
         return ELBO_lik
 
@@ -152,14 +154,14 @@ class psNMF(VBBase):
         self.q_lambda_W.update(self.q_W.mean)
         self.q_lambda_H.update(self.q_H.mean)
         # noise update
-        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum, 
+        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum,
                           self.q_H.mean, self.stats_R.mean_sq_sum)
 
     def _ELBO(self):
         base_elbo = self._base_ELBO() # noise elbo is included here
-        elbo_W = self.q_W.elbo_part(self.q_lambda_W.mean, 
+        elbo_W = self.q_W.elbo_part(self.q_lambda_W.mean,
                                     self.q_lambda_W.ln_mean)
-        elbo_H = self.q_H.elbo_part(self.q_lambda_H.mean, 
+        elbo_H = self.q_H.elbo_part(self.q_lambda_H.mean,
                                     self.q_lambda_H.ln_mean)
         elbo_lambda_W = self.q_lambda_W.elbo_part()
         elbo_lambda_H = self.q_lambda_H.elbo_part()
@@ -202,7 +204,7 @@ class psNMF(VBBase):
         self.stats_L.update()
         self.stats_R.update()
         # noise update
-        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum, 
+        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum,
                           self.q_H.mean, self.stats_R.mean_sq_sum)
 
 
@@ -215,31 +217,31 @@ class pNMF(VBBase):
         self.lambda_alpha = factor_prior_alpha
         self.lambda_beta = factor_prior_beta
 
-        self.q_lambda = FactorPriorGammaARD(self.I + self.J, self.lambda_alpha, 
+        self.q_lambda = FactorPriorGammaARD(self.I + self.J, self.lambda_alpha,
                                             self.lambda_beta)
 
     def _update(self):
 
         # update factors (W and H) one after the other
-        self.q_W.update(self.X, self.q_lambda.mean.reshape(1,-1), 
-                        self.q_tau.mean,self.q_H.mean, 
+        self.q_W.update(self.X, self.q_lambda.mean.reshape(1,-1),
+                        self.q_tau.mean,self.q_H.mean,
                         self.stats_R.mean_sq_sum)
         self.stats_L.update()
-        self.q_H.update(self.X, self.q_lambda.mean.reshape(-1,1), 
-                        self.q_tau.mean, self.q_W.mean, 
+        self.q_H.update(self.X, self.q_lambda.mean.reshape(-1,1),
+                        self.q_tau.mean, self.q_W.mean,
                         self.stats_L.mean_sq_sum)
         self.stats_R.update()
         # update hyperparameters (under ARD prior)
         self.q_lambda.update(self.q_W.mean, self.q_H.mean)
         # noise update
-        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum, 
+        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum,
                           self.q_H.mean, self.stats_R.mean_sq_sum)
 
     def _ELBO(self):
         base_elbo = self._base_ELBO() # noise elbo is included here
-        elbo_W = self.q_W.elbo_part(self.q_lambda.mean.reshape(1,-1), 
+        elbo_W = self.q_W.elbo_part(self.q_lambda.mean.reshape(1,-1),
                                     self.q_lambda.ln_mean.reshape(1,-1))
-        elbo_H = self.q_H.elbo_part(self.q_lambda.mean.reshape(-1,1), 
+        elbo_H = self.q_H.elbo_part(self.q_lambda.mean.reshape(-1,1),
                                     self.q_lambda.ln_mean.reshape(-1,1))
         elbo_lambda = self.q_lambda.elbo_part()
 
@@ -256,7 +258,7 @@ class pNMF(VBBase):
         for d in range(self.K):
             estimates  = sample_init_factor_element_ARD(
                                                     self.lambda_alpha,
-                                                    self.lambda_beta, 
+                                                    self.lambda_beta,
                                                     self.I,
                                                     n_samples_lam=10,
                                                     n_samples_F=10
@@ -265,7 +267,7 @@ class pNMF(VBBase):
 
             estimates = sample_init_factor_element_ARD(
                                                     self.lambda_alpha,
-                                                    self.lambda_beta, 
+                                                    self.lambda_beta,
                                                     self.J,
                                                     n_samples_lam=10,
                                                     n_samples_F=10
@@ -282,7 +284,7 @@ class pNMF(VBBase):
         # update hyperparameters (under ARD prior)
         self.q_lambda.update(self.q_W.mean, self.q_H.mean)
         # noise update
-        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum, 
+        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum,
                           self.q_H.mean, self.stats_R.mean_sq_sum)
 
 class bnsNMF(VBBase):
@@ -291,17 +293,18 @@ class bnsNMF(VBBase):
                  factor_prior_alpha, factor_prior_beta, pi_a, pi_b):
         super().__init__(X, K, tolerance, max_iter, noise_alpha, noise_beta)
 
-        self.q_W = BNPWFactor(0, np.inf, K, I)
-        self.q_Z = FactorBernoulli(K, I)
-        self.stats_L.Add_Factor(self.q_Z)
+        # add Z factor VB and overwrite Base Distributions
+        self.q_W = BNPWFactor(0, np.inf, K, self.I)
+        self.q_Z = FactorBernoulli(K, self.I)
+        self.stats_L = FactorStats(self.q_W, 'L')
+        self.stats_L.new_factor(self.q_Z)
 
         self.lambda_alpha = factor_prior_alpha
         self.lambda_beta = factor_prior_beta
         self.pi_alpha = pi_a/K
         self.pi_beta = pi_b*(1 - 1/K)
 
-
-        self.q_lambda_W = FactorPriorGamma(self.lambda_alpha, self.lambda_beta)
+        self.q_lambda_W = FactorPriorBNP(self.lambda_alpha, self.lambda_beta)
         self.q_lambda_H = FactorPriorGamma(self.lambda_alpha, self.lambda_beta)
         self.q_pi = BetaPrior(self.I, self.K, self.pi_alpha, self.pi_beta)
 
@@ -311,27 +314,27 @@ class bnsNMF(VBBase):
         self.q_W.update(self.X, self.q_lambda_W.mean, self.q_tau.mean,
                     self.stats_R.mean, self.stats_R.mean_sq_sum, self.q_Z.mean,
                     self.q_Z.mean_sq)
-        self.q_Z.update(self.q_pi.mean, self.q_pi.ln_o_mean, self.q_tau.mean,
-                        self.q_W.mean, self.q_W.mean_sq_sum, 
+        self.q_Z.update(self.X, self.q_pi.ln_mean, self.q_pi.ln_o_mean,
+                        self.q_tau.mean, self.q_W.mean, self.q_W.mean_sq,
                         self.stats_R.mean, self.stats_R.mean_sq_sum)
         self.stats_L.update()
         self.q_H.update(self.X, self.q_lambda_H.mean, self.q_tau.mean,
                         self.stats_L.mean, self.stats_L.mean_sq_sum)
         self.stats_R.update()
         # update hyperparameters (under sparse model)
-        self.q_lambda_W.update(self.q_W.mean)
+        self.q_lambda_W.update(self.q_W.mean_sq)
         self.q_lambda_H.update(self.q_H.mean)
         self.q_pi.update(self.q_Z.mean)
 
         # noise update
-        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum, 
+        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum,
                           self.q_H.mean, self.stats_R.mean_sq_sum)
 
     def _ELBO(self):
         base_elbo = self._base_ELBO() # noise elbo is included here
-        elbo_W = self.q_W.elbo_part(self.q_lambda_W.mean, 
+        elbo_W = self.q_W.elbo_part(self.q_lambda_W.mean,
                                     self.q_lambda_W.ln_mean)
-        elbo_H = self.q_H.elbo_part(self.q_lambda_H.mean, 
+        elbo_H = self.q_H.elbo_part(self.q_lambda_H.mean,
                                     self.q_lambda_H.ln_mean)
         elbo_Z = self.q_Z.elbo_part(self.q_pi.ln_mean, self.q_pi.ln_o_mean)
         elbo_lambda_W = self.q_lambda_W.elbo_part()
@@ -364,7 +367,7 @@ class bnsNMF(VBBase):
                                               self.I,
                                               n_samples_pi=10,
                                               n_samples_Z=10)
-            mean_Z[:,d], var[:,d] = estimates
+            mean_Z[:,d], var_Z[:,d] = estimates
 
         for d in range(self.K):
             for j in range(self.J):
@@ -388,5 +391,10 @@ class bnsNMF(VBBase):
         self.stats_L.update()
         self.stats_R.update()
         # noise update
-        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum, 
+        self.q_tau.update(self.q_W.mean, self.stats_L.mean_sq_sum,
                           self.q_H.mean, self.stats_R.mean_sq_sum)
+
+class GibbsSamplerbnpNMF:
+
+    def __init__(self):
+        pass

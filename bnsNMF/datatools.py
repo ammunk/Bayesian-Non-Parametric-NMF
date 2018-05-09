@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.special import digamma, gamma, gammaln
+from scipy.special import digamma, gamma, gammaln, xlogy
 from scipy.stats import expon, gamma as gamma_dist, \
                         beta as beta_dist, bernoulli
 
@@ -11,7 +11,7 @@ def trunc_moments(lower_bound, upper_bound, mu, sigma_sq):
     # vectorize moments(), such that moments() works elementwise when applied
     # to numpy arrays. If dimensions of the inputs does not match - numpy 
     # broadcasting is applied.
-    _, _, mean, var, entropy = vmoments(lower_bound, upper_bound, mu, sigma_sq)
+    _, Zhat, mean, var, entropy = vmoments(lower_bound, upper_bound, mu, sigma_sq)
     return mean, var, entropy
 
 ###############################################################################
@@ -88,7 +88,7 @@ def gamma_prior_elbo(mean, ln_mean, alpha_tau, beta_tau):
 
 def bernoulli_moments(pi):
     q = 1 - pi
-    return pi, pi * q, -q*np.log(q) - p*np.log(p)
+    return pi, pi*q, -(xlogy(q,q) + xlogy(pi,pi))
 
 def beta_moments(alpha, beta):
     mean = alpha/(alpha + beta)
@@ -141,6 +141,7 @@ def sample_init_factor_element_ARD(lambda_alpha, lambda_beta, factor_dimension,
     var = elements.var(ddof=1, axis=1)
 
     return mean, var
+
 def sample_init_Z_element(pi_alpha, pi_beta, factor_dimension,
                           n_samples_pi=50, n_samples_Z=10):
 
